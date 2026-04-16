@@ -1,0 +1,145 @@
+# rollback.yml
+# Manual rollback workflow.
+# Use when a developer sets Jira status to "Rejected" BEFORE merge,
+# or when a post-merge revert is needed.
+#
+# Pre-merge:  closes the PR and deletes the fix branch.
+# Post-merge: creates a revert commit on a new branch and opens a revert PR.
+
+name: Rollback Fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      jira_id:
+        description: "Jira issue key (e.g. VULN-42)"
+        required: true
+        type: string
+      repo_name:
+        description: "Target application repository name"
+        required: true
+        type: string
+      fix_branch:
+        description: "Fix branch name (e.g. fix/vuln-42-abc1234)"
+        required: true
+        type: string
+      mode:
+        description: "pre-merge = close PR + delete branch | post-merge = create revert PR"
+        required: true
+        type: choice
+        options:
+          - pre-merge
+          - post-merge
+      base_branch:
+        description: "Base branch to revert onto (post-merge only, default: main)"
+        required: false
+        default: "main"
+        type: string
+
+jobs:
+  rollback:
+    name: Rollback — ${{ inputs.mode }}
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout vuln-remediation framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GITHUB_ORG }}/vuln-remediation
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Execute rollback
+        env:
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN }}
+          GITHUB_ORG:          ${{ secrets.GITHUB_ORG }}
+          GOVERNANCE_REPO:     ${{ secrets.GOVERNANCE_REPO }}
+          JIRA_URL:            ${{ secrets.JIRA_URL }}
+          JIRA_USER:           ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN:          ${{ secrets.JIRA_TOKEN }}
+          JIRA_PROJECT_KEY:    ${{ secrets.JIRA_PROJECT_KEY }}
+        run: |
+          python - <<'PYEOF'
+          import os, subprocess, sys
+          from scripts.utils import github_client as gh, memory
+          from scripts.utils.config import JiraStatus, GITHUB_ORG
+          from scripts.utils.jira_client import JiraClient
+
+          jira_id    = "${{ inputs.jira_id }}"
+          repo       = "${{ inputs.repo_name }}"
+          fix_branch = "${{ inputs.fix_branch }}"
+          mode       = "${{ inputs.mode }}"
+          base       = "${{ inputs.base_branch }}" or "main"
+          token      = os.environ["GITHUB_TOKEN"]
+          jira       = JiraClient()
+
+          if mode == "pre-merge":
+              print(f"Pre-merge rollback: closing PR and deleting branch {fix_branch}")
+              gh.close_branch_prs(repo, fix_branch)
+              gh.delete_branch(repo, fix_branch)
+              jira.add_comment(jira_id,
+                  f"Rollback completed (pre-merge).\n"
+                  f"PR closed and branch '{fix_branch}' deleted.")
+              jira.transition(jira_id, JiraStatus.REJECTED)
+              memory.audit("rollback_pre_merge", jira_id, repo, "", actor="rollback-workflow",
+                           details={"branch": fix_branch})
+
+          elif mode == "post-merge":
+              import tempfile
+              print(f"Post-merge rollback: reverting {fix_branch} onto {base}")
+              revert_branch = f"revert/{fix_branch.replace('fix/', '')}"
+              url = f"https://x-access-token:{token}@github.com/{GITHUB_ORG}/{repo}.git"
+
+              with tempfile.TemporaryDirectory() as tmp:
+                  dest = f"{tmp}/{repo}"
+                  subprocess.run(["git", "clone", "--branch", base, url, dest], check=True)
+                  subprocess.run(["git", "config", "user.email",
+                                  "ai-remediation@automation.local"], cwd=dest, check=True)
+                  subprocess.run(["git", "config", "user.name",
+                                  "AI Remediation Bot"], cwd=dest, check=True)
+                  subprocess.run(["git", "checkout", "-b", revert_branch], cwd=dest, check=True)
+
+                  # Find the merge commit for the fix branch
+                  r = subprocess.run(
+                      ["git", "log", "--oneline", "--merges", "--grep", jira_id, "-1"],
+                      cwd=dest, capture_output=True, text=True
+                  )
+                  merge_sha = r.stdout.split()[0] if r.stdout.strip() else None
+
+                  if merge_sha:
+                      subprocess.run(["git", "revert", "-m", "1", "--no-edit", merge_sha],
+                                     cwd=dest, check=True)
+                  else:
+                      print(f"WARNING: could not find merge commit for {jira_id}; "
+                            f"manual revert may be needed", file=sys.stderr)
+
+                  subprocess.run(["git", "remote", "set-url", "origin", url], cwd=dest, check=True)
+                  subprocess.run(["git", "push", "origin", revert_branch], cwd=dest, check=True)
+
+              pr_url = gh.create_pr(
+                  repo_name = repo,
+                  title     = f"[Revert] {jira_id} — rollback security fix",
+                  body      = (f"Automated revert of fix branch `{fix_branch}`.\n\n"
+                               f"**Jira:** {jira_id}\n"
+                               f"**Reason:** Post-merge rollback requested via workflow.\n\n"
+                               f"Review and merge this PR to complete the rollback."),
+                  head      = revert_branch,
+                  base      = base,
+              )
+              jira.add_comment(jira_id,
+                  f"Rollback PR created (post-merge).\nRevert PR: {pr_url}\n"
+                  f"Please review and merge to complete the rollback.")
+              memory.audit("rollback_post_merge", jira_id, repo, "", actor="rollback-workflow",
+                           details={"revert_pr": pr_url, "revert_branch": revert_branch})
+
+          print("Rollback complete.")
+          PYEOF

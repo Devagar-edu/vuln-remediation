@@ -1,0 +1,53 @@
+# known-fixes/SNYK-JAVA-MYSQL-2386864.yaml
+# Validated fix for mysql-connector-java vulnerabilities.
+# This file covers all four CVEs in the sample normalised JSON.
+
+snyk_id: SNYK-JAVA-MYSQL-2386864
+cve:
+  - CVE-2022-21363   # Improper Authorization (CVSS 6.6) — fixed in 8.0.28
+  - CVE-2021-2471    # XXE Injection (CVSS 5.9)          — fixed in 8.0.27
+  - CVE-2019-2692    # Privilege Escalation (CVSS 6.3)   — fixed in 8.0.16
+  - CVE-2018-3258    # Access Control Bypass (CVSS 8.8)  — fixed in 8.0.13
+
+package: mysql:mysql-connector-java
+group_id: mysql
+artifact_id: mysql-connector-java
+fix_type: dependency_version_upgrade
+fix_version: "8.0.28"    # minimum version that resolves ALL four CVEs
+
+validated: true
+validated_by: security-lead@yourorg.com
+validated_date: "2026-01-10"
+tested_java_versions: ["11", "17", "21"]
+
+breaking_changes:
+  - description: "JDBC driver class name changed"
+    detail: >
+      Replace com.mysql.jdbc.Driver with com.mysql.cj.jdbc.Driver in any
+      explicit Class.forName() calls or JDBC URL driverClassName properties.
+    files_to_check:
+      - "src/main/resources/application.properties"
+      - "src/main/resources/application.yml"
+      - "src/main/java/**/*DataSource*.java"
+
+  - description: "SSL required by default"
+    detail: >
+      MySQL Connector/J 8.x enables SSL verification by default.
+      If your MySQL server does not have SSL configured, add
+      ?useSSL=false&allowPublicKeyRetrieval=true to the JDBC URL,
+      or configure ssl-mode=DISABLED in the connection properties.
+    files_to_check:
+      - "src/main/resources/application.properties"
+      - "src/main/resources/application.yml"
+
+  - description: "Timezone must be explicit"
+    detail: >
+      Add serverTimezone=UTC (or your local timezone) to the JDBC URL
+      to avoid NoSuchElementException on connection.
+    files_to_check:
+      - "src/main/resources/application.properties"
+
+notes: >
+  Validated on Spring Boot 2.7 and 3.x projects with Hibernate 5 and 6.
+  No functional regression observed in connection pooling (HikariCP) or
+  JPA query behaviour.

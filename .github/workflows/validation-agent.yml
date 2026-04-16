@@ -1,0 +1,87 @@
+# validation-agent.yml
+# Triggered automatically by the Fix Agent (workflow_dispatch) after it
+# pushes the fix branch and creates the PR.
+# Can also be re-triggered manually if validation needs to be re-run.
+
+name: Validation Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      jira_id:
+        description: "Jira issue key (e.g. VULN-42)"
+        required: true
+        type: string
+      remediation_id:
+        description: "UUID from the normalised vulnerability JSON"
+        required: true
+        type: string
+      fix_branch:
+        description: "Fix branch to validate (e.g. fix/vuln-42-abc1234)"
+        required: true
+        type: string
+
+jobs:
+  validate:
+    name: Validate fix branch
+    runs-on: self-hosted
+    concurrency:
+      group: validation-${{ inputs.jira_id }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout vuln-remediation framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GITHUB_ORG }}/vuln-remediation
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Maven (if not pre-installed)
+        run: |
+          if ! command -v mvn &>/dev/null; then
+            sudo apt-get update -q && sudo apt-get install -y -q maven
+          fi
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk@latest
+
+      - name: Run Validation Agent
+        env:
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN }}
+          GITHUB_ORG:          ${{ secrets.GITHUB_ORG }}
+          GOVERNANCE_REPO:     ${{ secrets.GOVERNANCE_REPO }}
+          JIRA_URL:            ${{ secrets.JIRA_URL }}
+          JIRA_USER:           ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN:          ${{ secrets.JIRA_TOKEN }}
+          JIRA_PROJECT_KEY:    ${{ secrets.JIRA_PROJECT_KEY }}
+          SNYK_TOKEN:          ${{ secrets.SNYK_TOKEN }}
+        run: |
+          python scripts/agents/validation_agent.py \
+            --jira-id        "${{ inputs.jira_id }}" \
+            --remediation-id "${{ inputs.remediation_id }}" \
+            --fix-branch     "${{ inputs.fix_branch }}"
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report-${{ inputs.jira_id }}
+          path: "validation-report.md"
+          retention-days: 30
+          if-no-files-found: ignore

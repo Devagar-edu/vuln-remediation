@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment / secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Test artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# Snyk scan outputs (generated at runtime — not committed)
+snyk-sca-raw.json
+snyk-sast-raw.json
+snyk-sca-patched.json
+snyk-sast-patched.json
+normalised.json
+normalised-sca.json
+normalised-sast.json
+build-failure.log
+validation-report.md
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.iws
+.DS_Store
+Thumbs.db
+
+# Maven (if running locally)
+target/
+
+# Logs
+*.log
+/tmp/orchestrator.*

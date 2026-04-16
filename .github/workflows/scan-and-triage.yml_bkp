@@ -1,0 +1,206 @@
+# scan-and-triage.yml
+# Runs on every push to main/develop and on PRs targeting main.
+# Steps: Snyk SCA + SAST → normalise → create/update Jira issues → severity gate.
+#
+# Required repository secrets:
+#   GITHUB_TOKEN           (auto-provided by Actions)
+#   GITHUB_MODELS_TOKEN    (GitHub Models PAT)
+#   GITHUB_ORG
+#   GOVERNANCE_REPO
+#   JIRA_URL
+#   JIRA_USER
+#   JIRA_TOKEN
+#   JIRA_PROJECT_KEY
+#   SNYK_TOKEN
+
+name: Vulnerability Scan and Triage
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+
+# One scan per ref at a time; cancel older runs on the same branch.
+concurrency:
+  group: scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan-and-triage:
+    name: Snyk → Normalise → Jira
+    runs-on: self-hosted          # change to ubuntu-latest if not using self-hosted
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────────────────
+      - name: Checkout application repo
+        uses: actions/checkout@v4
+
+      # ── Checkout remediation framework alongside ──────────────────────────────
+      - name: Checkout vuln-remediation framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GITHUB_ORG }}/vuln-remediation
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: vuln-remediation
+
+      # ── Java ─────────────────────────────────────────────────────────────────
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version-file: .java-version   # reads version from repo file — never hardcoded
+
+      # ── Python ───────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r vuln-remediation/requirements.txt
+
+      # ── Snyk ─────────────────────────────────────────────────────────────────
+      - name: Install Snyk CLI
+        run: npm install -g snyk@latest
+
+      - name: Authenticate Snyk
+        run: snyk auth ${{ secrets.SNYK_TOKEN }}
+
+      # ── SCA: dependency vulnerabilities ──────────────────────────────────────
+      - name: Snyk SCA — dependency scan
+        id: sca
+        run: |
+          snyk test \
+            --json \
+            --severity-threshold=low \
+            --file=pom.xml \
+            > snyk-sca-raw.json 2>/dev/null || true
+
+      # ── SAST: code vulnerabilities ────────────────────────────────────────────
+      - name: Snyk SAST — code scan
+        id: sast
+        run: |
+          snyk code test \
+            --json \
+            --severity-threshold=low \
+            > snyk-sast-raw.json 2>/dev/null || true
+
+      # ── Normalise SCA ─────────────────────────────────────────────────────────
+      - name: Normalise SCA output
+        env:
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN }}
+          GITHUB_ORG:          ${{ secrets.GITHUB_ORG }}
+          GOVERNANCE_REPO:     ${{ secrets.GOVERNANCE_REPO }}
+          JIRA_URL:            ${{ secrets.JIRA_URL }}
+          JIRA_USER:           ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN:          ${{ secrets.JIRA_TOKEN }}
+          JIRA_PROJECT_KEY:    ${{ secrets.JIRA_PROJECT_KEY }}
+          SNYK_TOKEN:          ${{ secrets.SNYK_TOKEN }}
+        run: |
+          python vuln-remediation/scripts/normalise.py snyk-sca-raw.json \
+            --out  normalised-sca.json \
+            --repo "${{ github.event.repository.name }}" \
+            --branch "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}"
+
+      # ── Normalise SAST ────────────────────────────────────────────────────────
+      - name: Normalise SAST output
+        env:
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN }}
+          GITHUB_ORG:          ${{ secrets.GITHUB_ORG }}
+          GOVERNANCE_REPO:     ${{ secrets.GOVERNANCE_REPO }}
+          JIRA_URL:            ${{ secrets.JIRA_URL }}
+          JIRA_USER:           ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN:          ${{ secrets.JIRA_TOKEN }}
+          JIRA_PROJECT_KEY:    ${{ secrets.JIRA_PROJECT_KEY }}
+          SNYK_TOKEN:          ${{ secrets.SNYK_TOKEN }}
+        run: |
+          python vuln-remediation/scripts/normalise.py snyk-sast-raw.json \
+            --out  normalised-sast.json \
+            --repo "${{ github.event.repository.name }}" \
+            --branch "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}"
+
+      # ── Merge normalised outputs ──────────────────────────────────────────────
+      - name: Merge SCA + SAST into single normalised file
+        run: |
+          python - <<'PYEOF'
+          import json, uuid
+          from datetime import datetime, timezone
+
+          sca  = json.loads(open("normalised-sca.json").read())
+          sast = json.loads(open("normalised-sast.json").read())
+
+          merged = {
+            "scan_metadata": sca["scan_metadata"],   # use SCA metadata as primary
+            "dependency_vulnerabilities": sca.get("dependency_vulnerabilities", []),
+            "code_vulnerabilities":       sast.get("code_vulnerabilities", []),
+            "summary": {
+              "total_dependencies": sca["summary"]["total_dependencies"],
+              "total_code_issues":  sast["summary"]["total_code_issues"],
+              "critical_count": (sca["summary"]["critical_count"]
+                                 + sast["summary"]["critical_count"]),
+              "high_count":     (sca["summary"]["high_count"]
+                                 + sast["summary"]["high_count"]),
+              "medium_count":   (sca["summary"]["medium_count"]
+                                 + sast["summary"]["medium_count"]),
+              "low_count":      (sca["summary"]["low_count"]
+                                 + sast["summary"]["low_count"]),
+            }
+          }
+          json.dump(merged, open("normalised.json", "w"), indent=2)
+          print("Merged normalised.json written")
+          PYEOF
+
+      # ── Jira triage ───────────────────────────────────────────────────────────
+      - name: Create or update Jira issues
+        env:
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN }}
+          GITHUB_ORG:          ${{ secrets.GITHUB_ORG }}
+          GOVERNANCE_REPO:     ${{ secrets.GOVERNANCE_REPO }}
+          JIRA_URL:            ${{ secrets.JIRA_URL }}
+          JIRA_USER:           ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN:          ${{ secrets.JIRA_TOKEN }}
+          JIRA_PROJECT_KEY:    ${{ secrets.JIRA_PROJECT_KEY }}
+          SNYK_TOKEN:          ${{ secrets.SNYK_TOKEN }}
+        run: |
+          python vuln-remediation/scripts/jira_triage.py normalised.json \
+            --repo   "${{ github.event.repository.name }}" \
+            --branch "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}"
+
+      # ── Upload artefacts ──────────────────────────────────────────────────────
+      - name: Upload scan artefacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-results-${{ github.sha }}
+          path: |
+            snyk-sca-raw.json
+            snyk-sast-raw.json
+            normalised.json
+          retention-days: 30
+
+      # ── Severity gate (fails the build) ───────────────────────────────────────
+      - name: Enforce severity gate
+        env:
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN }}
+          GITHUB_ORG:          ${{ secrets.GITHUB_ORG }}
+          GOVERNANCE_REPO:     ${{ secrets.GOVERNANCE_REPO }}
+          JIRA_URL:            ${{ secrets.JIRA_URL }}
+          JIRA_USER:           ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN:          ${{ secrets.JIRA_TOKEN }}
+          JIRA_PROJECT_KEY:    ${{ secrets.JIRA_PROJECT_KEY }}
+          SNYK_TOKEN:          ${{ secrets.SNYK_TOKEN }}
+        run: |
+          python vuln-remediation/scripts/fail_check.py normalised.json \
+            --threshold high

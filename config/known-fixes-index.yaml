@@ -1,0 +1,19 @@
+# known-fixes/index.yaml
+# Index of validated fix patterns stored in this directory.
+# Each entry maps a Snyk vulnerability ID to its fix file.
+# The Fix Agent loads this index to fast-path known CVEs.
+#
+# To add a new validated fix:
+#   1. Create known-fixes/{snyk_id}.yaml with the fix details
+#   2. Add an entry to this index
+#   3. Open a PR; Security Lead reviews and merges
+
+known_fixes:
+  # Example validated fix entry (remove before production use):
+  # - snyk_id: SNYK-JAVA-MYSQL-2386864
+  #   cve: CVE-2022-21363
+  #   package: mysql:mysql-connector-java
+  #   fix_version: "8.0.28"
+  #   validated: true
+  #   validated_by: security-lead@yourorg.com
+  #   validated_date: "2026-01-10"

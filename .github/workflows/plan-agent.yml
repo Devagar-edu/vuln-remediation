@@ -1,0 +1,68 @@
+# plan-agent.yml
+# Triggered by the orchestrator (workflow_dispatch) when a developer
+# sets the Jira status to "Assign to AI".
+#
+# Required repository secrets (same set as scan-and-triage.yml):
+#   GITHUB_TOKEN, GITHUB_MODELS_TOKEN, GITHUB_ORG, GOVERNANCE_REPO,
+#   JIRA_URL, JIRA_USER, JIRA_TOKEN, JIRA_PROJECT_KEY
+
+name: Plan Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      jira_id:
+        description: "Jira issue key (e.g. VULN-42)"
+        required: true
+        type: string
+      remediation_id:
+        description: "UUID from the normalised vulnerability JSON"
+        required: true
+        type: string
+
+jobs:
+  plan:
+    name: Generate remediation plan
+    runs-on: self-hosted
+    # Prevent two Plan Agent runs for the same issue overlapping
+    concurrency:
+      group: plan-${{ inputs.jira_id }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout vuln-remediation framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GITHUB_ORG }}/vuln-remediation
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Plan Agent
+        env:
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN }}
+          GITHUB_ORG:          ${{ secrets.GITHUB_ORG }}
+          GOVERNANCE_REPO:     ${{ secrets.GOVERNANCE_REPO }}
+          JIRA_URL:            ${{ secrets.JIRA_URL }}
+          JIRA_USER:           ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN:          ${{ secrets.JIRA_TOKEN }}
+          JIRA_PROJECT_KEY:    ${{ secrets.JIRA_PROJECT_KEY }}
+          SNYK_TOKEN:          ${{ secrets.SNYK_TOKEN }}
+        run: |
+          python scripts/agents/plan_agent.py \
+            --jira-id        "${{ inputs.jira_id }}" \
+            --remediation-id "${{ inputs.remediation_id }}"
+
+      - name: Summarise result
+        if: always()
+        run: |
+          echo "Plan Agent completed for ${{ inputs.jira_id }}"
+          echo "Check Jira issue for attached remediation-plan-vN.md"

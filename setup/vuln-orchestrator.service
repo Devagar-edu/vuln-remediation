@@ -1,0 +1,61 @@
+# vuln-orchestrator.service
+# ─────────────────────────────────────────────────────────────────────────────
+# Systemd service unit for the vulnerability remediation orchestrator.
+# Runs the Flask webhook listener as a persistent background service on the
+# self-hosted GitHub Actions runner host.
+#
+# Installation:
+#   1. Copy this file to /etc/systemd/system/vuln-orchestrator.service
+#   2. Edit WorkingDirectory and EnvironmentFile paths to match your install
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now vuln-orchestrator
+#   5. sudo systemctl status vuln-orchestrator
+#
+# Logs:
+#   sudo journalctl -u vuln-orchestrator -f
+#
+# Restart after config change:
+#   sudo systemctl restart vuln-orchestrator
+
+[Unit]
+Description=Vulnerability Remediation Orchestrator (Jira webhook listener)
+Documentation=https://github.com/YOUR-ORG/vuln-remediation
+After=network-online.target
+Wants=network-online.target
+# Restart if the process dies for any reason
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=github-runner
+Group=github-runner
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+# Change these to match where you cloned vuln-remediation
+WorkingDirectory=/home/github-runner/vuln-remediation
+EnvironmentFile=/home/github-runner/vuln-remediation/.env
+
+# ── Python ────────────────────────────────────────────────────────────────────
+# Use the python from the virtualenv if you created one, otherwise system python
+ExecStart=/usr/bin/python3 scripts/orchestrator.py
+
+# ── Restart policy ────────────────────────────────────────────────────────────
+Restart=on-failure
+RestartSec=10s
+
+# ── Hardening (optional but recommended for production) ───────────────────────
+# Uncomment these once the service is working correctly:
+# NoNewPrivileges=yes
+# ProtectSystem=strict
+# ProtectHome=read-only
+# PrivateTmp=yes
+# ReadWritePaths=/home/github-runner/vuln-remediation
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vuln-orchestrator
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+# exceptions/exceptions.yaml
+# Vulnerabilities approved for suppression.
+# Only Security Lead may add entries here.
+# Each entry must have: vuln_id, reason, approved_by, approved_date, review_date
+#
+# To add an exception:
+#   1. Raise a Security Exception request in Jira
+#   2. Get Security Lead approval
+#   3. Add the entry below via PR to this governance repo
+#   4. Set the Jira issue status to "Excepted"
+
+exceptions:
+  # Example entry (remove before production use):
+  # - vuln_id: SNYK-JAVA-EXAMPLE-000000
+  #   reason: >
+  #     This vulnerability requires an authenticated attacker with network access
+  #     to an internal-only service. Risk accepted for Q1 2026; review in Q2.
+  #   approved_by: security-lead@yourorg.com
+  #   approved_date: "2026-01-15"
+  #   review_date: "2026-04-15"
