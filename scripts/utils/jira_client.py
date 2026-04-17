@@ -61,7 +61,7 @@ class JiraClient:
         "fields": ["key"]
         }
 
-        res = self._post("/search", body)   # ✅ POST instead of GET
+        res = self._post("/search/jql", body)   # ✅ POST instead of GET
         issues = res.get("issues", [])
         return issues[0]["key"] if issues else None
 
