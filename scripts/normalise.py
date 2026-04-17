@@ -19,6 +19,13 @@ import argparse
 import json
 import logging
 import sys
+from pathlib import Path
+
+# Ensure the vuln-remediation root is on sys.path so this script can be called
+# as "python vuln-remediation/scripts/normalise.py" from any working directory.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path

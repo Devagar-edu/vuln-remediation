@@ -50,6 +50,9 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
+
       # Java must be on PATH for mvn commands inside the Fix Agent
       - name: Set up Java
         uses: actions/setup-java@v4

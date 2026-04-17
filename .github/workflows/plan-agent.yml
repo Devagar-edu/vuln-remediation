@@ -45,6 +45,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Scripts are called as "python scripts/agents/foo.py" from the
+      # vuln-remediation checkout root, so PYTHONPATH must point there.
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
+
       - name: Run Plan Agent
         env:
           GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
