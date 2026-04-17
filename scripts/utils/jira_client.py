@@ -48,12 +48,20 @@ class JiraClient:
     def get_issue(self, key: str) -> dict:
         return self._get(f"/issue/{key}")
 
+ 
     def find_open_issue(self, snyk_id: str, repo: str) -> Optional[str]:
-        """Return the key of an existing open issue for this vuln+repo, or None."""
+    
         jql = (f'project="{JIRA_PROJECT_KEY}" AND summary~"{snyk_id}" '
-               f'AND labels="{repo}" '
-               f'AND status NOT IN ("Closed","Excepted","Rejected")')
-        res = self._get("/search", params={"jql": jql, "maxResults": 1, "fields": "key"})
+           f'AND labels="{repo}" '
+           f'AND status NOT IN ("Closed","Excepted","Rejected")')
+
+        body = {
+        "jql": jql,
+        "maxResults": 1,
+        "fields": ["key"]
+        }
+
+        res = self._post("/search", body)   # ✅ POST instead of GET
         issues = res.get("issues", [])
         return issues[0]["key"] if issues else None
 
