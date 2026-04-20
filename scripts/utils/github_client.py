@@ -16,9 +16,16 @@ _gh = Github(GITHUB_TOKEN)
 
 # ── Repo helpers ──────────────────────────────────────────────────────────────
 
-def get_repo(repo_name: str):
-    """Return a PyGithub Repository for org/repo_name."""
-    return _gh.get_repo(f"{GITHUB_ORG}/{repo_name}")
+def get_repo(repo_name):
+    try:
+        print(f"Fetching repository: {GITHUB_ORG}/{repo_name}")
+        return _gh.get_repo(f"{GITHUB_ORG}/{repo_name}")
+    except GithubException.UnknownObjectException:
+        print(f"Repository {GITHUB_ORG}/{repo_name} not found.")
+        raise
+    except GithubException as e:
+        print(f"An error occurred: {e}")
+        raise
 
 
 def get_gov_repo():
