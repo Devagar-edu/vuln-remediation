@@ -112,13 +112,15 @@ def _groups_from_norm(norm: dict) -> list[dict]:
 # ── Main triage ───────────────────────────────────────────────────────────────
 
 def triage(norm: dict, jira: JiraClient) -> list[str]:
-    """Create/update Jira issues.  Returns list of issue keys touched."""
-    meta   = norm["scan_metadata"]
-    repo   = meta["repository"]
+    """Create/update a single Jira issue per execution. Returns the issue key."""
+    meta = norm["scan_metadata"]
+    repo = meta["repository"]
     rem_id = meta["remediation_id"]
-    desc   = _description_text(norm)
+    desc = _description_text(norm)
     touched: list[str] = []
 
+    # Aggregate all groups into a single description
+    aggregated_description = f"Repository: {repo}\nRemediation ID: {rem_id}\n\n"
     for group in _groups_from_norm(norm):
         primary = group["primary_id"]
 
@@ -128,53 +130,27 @@ def triage(norm: dict, jira: JiraClient) -> list[str]:
             log.info("Skipping excepted vulnerability %s: %s", primary, reason)
             continue
 
-        # 2. De-duplicate against open Jira issues
-        existing = jira.find_open_issue(primary, repo)
-        if existing:
-            log.info("Issue %s already open for %s — updating comment", existing, primary)
-            jira.add_comment(existing,
-                f"Re-scan at {meta['scan_time']} still detects this vulnerability.\n"
-                f"Commit: {meta['commit_id']}")
-            touched.append(existing)
-            continue
+        # Add group details to the aggregated description
+        aggregated_description += f"- Vulnerability: {primary}\n"
 
-        # 3. Create new issue
-        priority = JiraClient.severity_to_priority(group["severity"])
-        labels   = [repo, group["type"], group["severity"],
-                    f"rem-{rem_id[:8]}"]   # short tag for searchability
-
-        key = jira.create_issue(
-            summary     = group["summary"],
-            description = JiraClient.to_adf(desc),
-            labels      = labels,
-            priority    = priority,
+    # 2. Check for an existing Jira issue for this remediation ID
+    existing = jira.find_open_issue(rem_id, repo)
+    if existing:
+        log.info("Issue %s already open for remediation ID %s — updating description", existing, rem_id)
+        jira.update_issue(existing, aggregated_description)
+        touched.append(existing)
+    else:
+        # 3. Create a new Jira issue
+        new_issue = jira.create_issue(
+            summary=f"Remediation for {repo} - {rem_id}",
+            description=aggregated_description,
+            project=meta["jira_project"],
+            issue_type="Task"  # Adjust the issue type as needed
         )
-
-        # 4. Store remediation_id as a label for webhook lookups
-        jira.add_label(key, f"remediation-id-{rem_id}")
-
-        # 5. Attach the full normalised JSON
-        jira.add_attachment(key, "normalised-vulnerabilities.json",
-                            json.dumps(norm, indent=2).encode(), "application/json")
-
-        # 6. Transition to Open
-        jira.transition(key, JiraStatus.OPEN)
-
-        # 7. Audit
-        memory.audit(
-            event          = "jira_issue_created",
-            jira_id        = key,
-            repo           = repo,
-            remediation_id = rem_id,
-            actor          = "jira-triage",
-            details        = {"vuln_ids": group["all_ids"], "severity": group["severity"]},
-        )
-
-        touched.append(key)
-        log.info("Created %s for %s", key, primary)
+        log.info("Created new Jira issue %s for remediation ID %s", new_issue, rem_id)
+        touched.append(new_issue)
 
     return touched
-
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
