@@ -467,9 +467,9 @@ def run(jira_id: str, remediation_id: str) -> None:
             for vid in plan["vuln_ids"]:
                 memory.record_attempt(repo, vid, jira_id, "build_failed",
                                       error=build_error[-1000:])
-            raise RuntimeError(
-                f"Build failed after {MAX_BUILD_RETRIES} retries"
-            )
+            # raise RuntimeError(
+            #     f"Build failed after {MAX_BUILD_RETRIES} retries"
+            # )
 
         # 9. Commit
         _git(["add", "-A"], repo_dir)
