@@ -20,6 +20,10 @@ import logging
 import sys
 from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from scripts.utils import memory
 from scripts.utils.config import JiraStatus, SEVERITY_ORDER, JIRA_PROJECT_KEY
 from scripts.utils.jira_client import JiraClient
