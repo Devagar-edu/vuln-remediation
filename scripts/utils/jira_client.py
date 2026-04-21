@@ -48,17 +48,14 @@ class JiraClient:
     def get_issue(self, key: str) -> dict:
         return self._get(f"/issue/{key}")
 
-    def update_issue(self, issue_key: str, description: str) -> None:
-        """Update the description of an existing Jira issue."""
-        issue = self.jira.issue(issue_key)
-        issue.update(fields={"description": description})
-
- 
-    def find_open_issue(self, remediation_id: str, repo: str) -> str | None:
-        """Find an open Jira issue for the given remediation ID and repository."""
-        jql = f'project = "{self.project}" AND summary ~ "{remediation_id}" AND status != "Done"'
-        issues = self.jira.search_issues(jql)
-        return issues[0].key if issues else None
+    def find_open_issue(self, snyk_id: str, repo: str) -> Optional[str]:
+        """Return the key of an existing open issue for this vuln+repo, or None."""
+        jql = (f'project="{JIRA_PROJECT_KEY}" AND summary~"{snyk_id}" '
+               f'AND labels="{repo}" '
+               f'AND status NOT IN ("Closed","Excepted","Rejected")')
+        res = self._get("/search", params={"jql": jql, "maxResults": 1, "fields": "key"})
+        issues = res.get("issues", [])
+        return issues[0]["key"] if issues else None
 
     def create_issue(self, summary: str, description: dict,
                      labels: list[str], priority: str) -> str:
