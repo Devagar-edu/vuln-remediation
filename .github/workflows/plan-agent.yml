@@ -23,7 +23,7 @@ on:
 jobs:
   plan:
     name: Generate remediation plan
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     # Prevent two Plan Agent runs for the same issue overlapping
     concurrency:
       group: plan-${{ inputs.jira_id }}
