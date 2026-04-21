@@ -23,6 +23,11 @@ on:
         description: "UUID from the normalised vulnerability JSON"
         required: true
         type: string
+      max_build_retries:
+        description: "How many times to ask the LLM to correct a failing build (default: 3)"
+        required: false
+        type: string
+        default: "3"
 
 jobs:
   fix:
@@ -53,7 +58,7 @@ jobs:
           cache: pip
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install --upgrade -r requirements.txt
 
       - name: Set PYTHONPATH
         run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
@@ -88,6 +93,7 @@ jobs:
           JIRA_TOKEN:          ${{ secrets.JIRA_TOKEN }}
           JIRA_PROJECT_KEY:    ${{ secrets.JIRA_PROJECT_KEY }}
           SNYK_TOKEN:          ${{ secrets.SNYK_TOKEN }}
+          MAX_BUILD_RETRIES:   ${{ inputs.max_build_retries || '3' }}
         run: |
           python scripts/agents/fix_agent.py \
             --jira-id        "${{ inputs.jira_id }}" \

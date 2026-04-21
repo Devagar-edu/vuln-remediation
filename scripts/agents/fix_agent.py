@@ -3,12 +3,22 @@
 fix_agent.py — Apply an approved remediation plan to pom.xml and source files,
                then raise a Pull Request.
 
-Triggered by fix-agent.yml (workflow_dispatch).  The workflow must have
-already checked out the target repository before calling this script.
+Triggered by fix-agent.yml (workflow_dispatch).
+                                                                     
 
 Usage:
     python scripts/agents/fix_agent.py \
         --jira-id VULN-42 --remediation-id <uuid>
+
+Build retry logic
+-----------------
+If mvn compile or mvn test fails the agent does NOT immediately give up.
+Instead it:
+  1. Feeds the compiler / test error back to the LLM as a correction prompt.
+  2. Re-applies the corrected file(s).
+  3. Re-runs the build.
+This cycle repeats up to MAX_BUILD_RETRIES times before the agent marks the
+issue Fix Failed.
 """
 from __future__ import annotations
 
@@ -32,6 +42,8 @@ from scripts.utils.llm_client import chat
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+MAX_BUILD_RETRIES = int(os.environ.get("MAX_BUILD_RETRIES", "3"))
+
 # ── LLM system prompt for source-code fixes ───────────────────────────────────
 FIX_SYSTEM_PROMPT = """\
 You are a Java security engineer.  Apply the minimal fix described in the
@@ -48,6 +60,57 @@ STRICT RULES:
 7. SQL injection → use PreparedStatement with parameter placeholders.
 8. Output ONLY the complete fixed file.  No markdown fences, no explanation.
 """
+
+# ── LLM system prompt for build-error correction ──────────────────────────────
+CORRECTION_SYSTEM_PROMPT = """\
+You are a Java security engineer reviewing a fix that caused a build failure.
+
+Your task: correct the Java source file so the build error is resolved while
+keeping the original security fix in place.
+
+STRICT RULES:
+1. Keep the security fix that was already applied — do not revert it.
+2. Fix ONLY what the compiler or test error requires.
+3. Do not change method signatures, class names, or package declarations.
+4. Do not add or remove any imports beyond what is strictly required.
+5. Output ONLY the complete corrected file.  No markdown fences, no explanation.
+"""
+
+
+# ── Plan loader — Jira first, governance repo fallback ────────────────────────
+
+def _load_plan(jira: JiraClient, jira_id: str) -> str:
+    """
+    Fetch the approved plan.
+
+    Primary:  the plan Markdown attached to the Jira ticket itself.
+              The plan agent attaches it as  remediation-plan-vN.md.
+              We try v1..v10 newest-first, same as the governance fallback.
+    Fallback: governance repo (plans/{jira_id}/plan-vN.md).
+              Used if the Jira attachment is missing (e.g. attachment was
+              manually deleted or the ticket was recreated).
+    """
+    # Try Jira attachments newest-first
+    for v in range(10, 0, -1):
+        raw = jira.get_attachment(jira_id, f"remediation-plan-v{v}.md")
+        if raw:
+            log.info("Loaded plan v%d from Jira attachment on %s", v, jira_id)
+            return raw
+
+    # Fallback: governance repo
+    log.warning(
+        "Plan not found as Jira attachment on %s — falling back to governance repo",
+        jira_id,
+    )
+    plan = memory.latest_plan(jira_id)
+    if plan:
+        log.info("Loaded plan from governance repo for %s", jira_id)
+        return plan
+
+    raise RuntimeError(
+        f"No approved plan found for {jira_id}. "
+        "Expected a 'remediation-plan-vN.md' attachment on the Jira ticket."
+    )
 
 
 # ── Plan parser ───────────────────────────────────────────────────────────────
@@ -160,12 +223,33 @@ def fix_source_file(repo: str, branch: str, file_path: str,
     )
 
     fixed = chat(FIX_SYSTEM_PROMPT, user_prompt, max_tokens=8192, temperature=0.05)
+    return original, _strip_fences(fixed)
 
-    # Strip any accidental markdown fences
-    fixed = re.sub(r"^```(?:java|xml)?\s*\n?", "", fixed.strip())
-    fixed = re.sub(r"\n?```\s*$", "", fixed)
+                                          
+                                                                 
+                                            
 
-    return original, fixed
+def correct_source_file(file_path: str, current_content: str,
+                        build_error: str, plan_context: str) -> str:
+    """
+    Ask the LLM to correct a file that caused a build failure.
+    Returns the corrected file content.
+    """
+    user_prompt = (
+        f"File: {file_path}\n\n"
+        f"Build / test error output (last 3000 chars):\n"
+        f"{build_error[-3000:]}\n\n"
+        f"Current (broken) file content:\n{current_content}\n\n"
+        f"Original plan context:\n{plan_context[:2000]}"
+    )
+    corrected = chat(CORRECTION_SYSTEM_PROMPT, user_prompt,
+                     max_tokens=8192, temperature=0.05)
+    return _strip_fences(corrected)
+
+
+def _strip_fences(text: str) -> str:
+    text = re.sub(r"^```(?:java|xml)?\s*\n?", "", text.strip())
+    return re.sub(r"\n?```\s*$", "", text)
 
 
 # ── Shell helpers ─────────────────────────────────────────────────────────────
@@ -193,12 +277,46 @@ def _clone(repo: str, branch: str, dest: str) -> None:
     log.info("Cloned %s@%s → %s", repo, branch, dest)
 
 
+# ── Build helpers ─────────────────────────────────────────────────────────────
+
+def _mvn(goal: str, repo_dir: str, timeout: int = 600) -> tuple[int, str]:
+    return _sh(
+        ["mvn", "--batch-mode", "--no-transfer-progress", goal],
+        repo_dir,
+        timeout=timeout,
+    )
+
+
+def _apply_corrections(repo_dir: str, repo: str, branch: str,
+                       build_error: str, plan_md: str,
+                       code_by_file: dict[str, list],
+                       attempt: int) -> list[tuple[str, str]]:
+    """
+    For each source file that was changed, ask the LLM to correct it given
+    the build error.  Writes corrected files into repo_dir.
+    Returns new file_diffs list.
+    """
+    log.info("Build retry %d/%d — asking LLM to correct failing files",
+             attempt, MAX_BUILD_RETRIES)
+    file_diffs = []
+    for file_path, _changes in code_by_file.items():
+        abs_path = os.path.join(repo_dir, file_path.replace("/", os.sep))
+        current = Path(abs_path).read_text()
+        corrected = correct_source_file(file_path, current, build_error, plan_md)
+        # Only write if the LLM actually changed something
+        if corrected != current:
+            Path(abs_path).write_text(corrected)
+            log.info("Correction applied: %s", file_path)
+        file_diffs.append((current, corrected))
+    return file_diffs
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(jira_id: str, remediation_id: str) -> None:
     jira = JiraClient()
 
-    # 1. Load Jira attachments
+    # 1. Load normalised JSON from Jira attachment
     raw_norm = jira.get_attachment(jira_id, "normalised-vulnerabilities.json")
     if not raw_norm:
         raise RuntimeError("normalised-vulnerabilities.json not found on Jira issue")
@@ -207,10 +325,10 @@ def run(jira_id: str, remediation_id: str) -> None:
     repo   = meta["repository"]
     branch = meta["branch"]
 
-    plan_md = memory.latest_plan(jira_id)
-    if not plan_md:
-        raise RuntimeError(f"No approved plan found for {jira_id}")
-    plan = parse_plan(plan_md)
+    # 2. Load plan — from Jira attachment (primary), governance repo (fallback)
+                   
+    plan_md = _load_plan(jira, jira_id)
+    plan    = parse_plan(plan_md)
 
     log.info("Fix Agent: %s  repo=%s  dep_changes=%d  code_changes=%d",
              jira_id, repo, len(plan["dep_changes"]), len(plan["code_changes"]))
@@ -219,7 +337,7 @@ def run(jira_id: str, remediation_id: str) -> None:
                  details={"dep": len(plan["dep_changes"]),
                           "code": len(plan["code_changes"])})
 
-    # 2. Build fix branch name
+    # 3. Build fix branch name
     short = hashlib.sha1(remediation_id.encode()).hexdigest()[:7]
     fix_branch = f"fix/{jira_id.lower()}-{short}"
 
@@ -227,21 +345,21 @@ def run(jira_id: str, remediation_id: str) -> None:
         repo_dir = os.path.join(tmp, repo)
         _clone(repo, branch, repo_dir)
 
-        # Configure git identity
+                                
         _git(["config", "user.email", "ai-remediation@automation.local"], repo_dir)
-        _git(["config", "user.name", "AI Remediation Bot"], repo_dir)
+        _git(["config", "user.name",  "AI Remediation Bot"], repo_dir)
         _git(["checkout", "-b", fix_branch], repo_dir)
 
         pom_path     = os.path.join(repo_dir, "pom.xml")
         original_pom = Path(pom_path).read_text()
         new_pom      = original_pom
 
-        # 3. Update pom.xml
+        # 4. Update pom.xml
         if plan["dep_changes"]:
             new_pom = update_pom(original_pom, plan["dep_changes"])
             Path(pom_path).write_text(new_pom)
 
-        # 4. Fix source files via LLM
+        # 5. Fix source files via LLM (initial pass)
         file_diffs: list[tuple[str, str]] = []
         approved_source_files: list[str]  = []
         code_by_file: dict[str, list]     = {}
@@ -260,8 +378,10 @@ def run(jira_id: str, remediation_id: str) -> None:
             Path(abs_path).write_text(fixed)
             log.info("Fixed: %s", file_path)
 
-        # 5. Run guardrails BEFORE committing
+                                             
         changed_files = approved_source_files + (["pom.xml"] if plan["dep_changes"] else [])
+
+        # 6. Guardrails (run once — these are policy checks, not build checks)
         try:
             run_all(
                 pom_before     = original_pom,
@@ -272,49 +392,98 @@ def run(jira_id: str, remediation_id: str) -> None:
             )
             log.info("All guardrails passed ✓")
         except GuardrailError as exc:
-            jira.add_comment(jira_id,
-                f"Fix Agent ABORTED — guardrail violation:\n{exc}")
+                                     
+            jira.add_comment(jira_id, f"Fix Agent ABORTED — guardrail violation:\n{exc}")
             jira.transition(jira_id, JiraStatus.FIX_FAILED)
             raise
 
-        # 6. Verify dependency resolution
-        rc, out = _sh(["mvn", "--batch-mode", "--no-transfer-progress",
-                        "dependency:resolve", "-q"], repo_dir)
+        # 7. Verify dependency resolution
+                                                                       
+        rc, out = _mvn("dependency:resolve -q", repo_dir)
         if rc != 0:
+            jira.add_comment(jira_id,
+                f"Fix Agent: dependency resolution failed. "
+                f"Check pom.xml version changes.\n\n{out[-2000:]}")
+            jira.transition(jira_id, JiraStatus.FIX_FAILED)
             raise RuntimeError(f"mvn dependency:resolve failed:\n{out[-3000:]}")
         log.info("Dependency resolution OK ✓")
 
-        # 7. Compile
-        rc, out = _sh(["mvn", "--batch-mode", "--no-transfer-progress",
-                        "compile", "-q"], repo_dir)
-        if rc != 0:
-            raise RuntimeError(f"mvn compile failed:\n{out[-3000:]}")
-        log.info("Compilation OK ✓")
+        # 8. Compile + test with LLM-assisted retry loop
+        #    Each failed build feeds the error back to the LLM which corrects
+        #    the source files; the build is then re-attempted.
+        build_error: str = ""
+        build_passed = False
+                                      
 
-        # 8. Run tests
-        rc, test_out = _sh(["mvn", "--batch-mode", "--no-transfer-progress",
-                              "test"], repo_dir)
-        if rc != 0:
+        for attempt in range(1, MAX_BUILD_RETRIES + 1):
+            # 8a. Correct source files if this is a retry
+            if attempt > 1 and code_by_file:
+                file_diffs = _apply_corrections(
+                    repo_dir, repo, branch, build_error, plan_md,
+                    code_by_file, attempt,
+                )
+                jira.add_comment(
+                    jira_id,
+                    f"Fix Agent: build attempt {attempt - 1} failed. "
+                    f"LLM correction applied — retrying build (attempt {attempt}/{MAX_BUILD_RETRIES}).\n\n"
+                    f"Error summary:\n{build_error[-1000:]}",
+                )
+
+            # 8b. Compile
+            rc, out = _mvn("compile -q", repo_dir)
+            if rc != 0:
+                build_error = out
+                log.warning("Compile failed (attempt %d/%d)", attempt, MAX_BUILD_RETRIES)
+                if attempt == MAX_BUILD_RETRIES:
+                    break
+                continue
+
+            log.info("Compilation OK ✓ (attempt %d)", attempt)
+
+            # 8c. Test
+            rc, test_out = _mvn("test", repo_dir)
+            if rc != 0:
+                build_error = test_out
+                log.warning("Tests failed (attempt %d/%d)", attempt, MAX_BUILD_RETRIES)
+                if attempt == MAX_BUILD_RETRIES:
+                    break
+                continue
+
+            log.info("All tests passed ✓ (attempt %d)", attempt)
+            build_passed = True
+            break
+
+        if not build_passed:
+            # All retries exhausted — attach full log and fail
             jira.add_attachment(jira_id, "build-failure.log",
-                                test_out.encode(), "text/plain")
-            jira.add_comment(jira_id,
-                "Fix Agent: tests FAILED after applying fixes. "
-                "Attached build-failure.log.  Status → Fix Failed.")
+                                build_error.encode(), "text/plain")
+            jira.add_comment(
+                jira_id,
+                f"Fix Agent: build FAILED after {MAX_BUILD_RETRIES} LLM correction "
+                f"attempt(s). Attached build-failure.log. Status → Fix Failed.\n\n"
+                f"Last error (truncated):\n{build_error[-1500:]}",
+            )
             jira.transition(jira_id, JiraStatus.FIX_FAILED)
             for vid in plan["vuln_ids"]:
-                memory.record_attempt(repo, vid, jira_id, "test_failed",
-                                      error=test_out[-1000:])
-            raise RuntimeError("Tests failed after fix")
-        log.info("All tests passed ✓")
+                memory.record_attempt(repo, vid, jira_id, "build_failed",
+                                      error=build_error[-1000:])
+            raise RuntimeError(
+                f"Build failed after {MAX_BUILD_RETRIES} retries"
+            )
 
         # 9. Commit
         _git(["add", "-A"], repo_dir)
         ids_str = ", ".join(plan["vuln_ids"][:5])
+        build_attempts_note = (
+            f"" if build_passed and build_error == ""
+            else f"\nBuild passed after LLM correction."
+        )
         commit_msg = (
             f"fix(security): remediate {ids_str} per {jira_id}\n\n"
             f"Remediation ID : {remediation_id}\n"
             f"Approved plan  : {jira_id} (attached to Jira)\n"
             f"Files changed  : {', '.join(changed_files)}"
+            f"{build_attempts_note}"
         )
         _git(["commit", "-m", commit_msg], repo_dir)
 
