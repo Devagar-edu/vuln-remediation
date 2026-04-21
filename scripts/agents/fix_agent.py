@@ -399,7 +399,7 @@ def run(jira_id: str, remediation_id: str) -> None:
 
         # 7. Verify dependency resolution
                                                                        
-        rc, out = _mvn("dependency:resolve -q", repo_dir)
+        rc, out = _mvn("-q dependency:resolve", repo_dir)
         if rc != 0:
             jira.add_comment(jira_id,
                 f"Fix Agent: dependency resolution failed. "
