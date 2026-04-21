@@ -33,6 +33,11 @@ jobs:
     concurrency:
       group: fix-${{ inputs.jira_id }}
       cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      models: read 
 
     steps:
       - name: Checkout vuln-remediation framework
