@@ -27,8 +27,8 @@ on:
 jobs:
   fix:
     name: Apply remediation and raise PR
-    runs-on: self-hosted
-    environment: ai-remediation    # optional manual-approval gate
+    runs-on: ubuntu-latest
+    #environment: ai-remediation    # optional manual-approval gate
     # One fix per issue; never run two in parallel for the same issue
     concurrency:
       group: fix-${{ inputs.jira_id }}
@@ -38,8 +38,8 @@ jobs:
       - name: Checkout vuln-remediation framework
         uses: actions/checkout@v4
         with:
-          repository: ${{ secrets.GITHUB_ORG }}/vuln-remediation
-          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ secrets.ORG_NAME }}/vuln-remediation
+          token: ${{ secrets.ORG_GITHUB_TOKEN }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
