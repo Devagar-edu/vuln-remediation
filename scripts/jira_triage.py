@@ -20,10 +20,6 @@ import logging
 import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
 from scripts.utils import memory
 from scripts.utils.config import JiraStatus, SEVERITY_ORDER, JIRA_PROJECT_KEY
 from scripts.utils.jira_client import JiraClient
@@ -126,32 +122,54 @@ def _issue_summary(norm: dict, top_severity: str) -> str:
 def _find_existing_issue(norm: dict, jira: JiraClient) -> str | None:
     """
     Look for an already-open Jira issue created for this remediation_id.
-    Falls back to searching by any of the individual vuln IDs.
+
+    Strategy (most reliable → least):
+    1. Label search on  rem-<first-8-chars-of-remediation-id>  — safe alphanumeric
+       label, no special characters that could break JQL.  This is the primary
+       dedup mechanism and is always tried first.
+    2. Full remediation-id label  remediation-id-<uuid>  — added after creation,
+       so may be absent on very fresh tickets; tried as a secondary label search.
+    3. Returns None if both searches fail or return nothing.  The caller will
+       then create a new issue.  We deliberately do NOT fall back to a
+       summary~"<snyk-id>" search because Snyk IDs contain colons and hyphens
+       that some Jira configurations reject with 410/400, causing the whole
+       pipeline to abort.
     """
     m = norm["scan_metadata"]
     repo = m["repository"]
     rem_id = m["remediation_id"]
 
-    # Primary: search by the remediation-id label (exact match, fast)
+    # ── Search 1: short rem- label (set at creation time, always alphanumeric) ──
     short_tag = f"rem-{rem_id[:8]}"
     from scripts.utils.config import JIRA_PROJECT_KEY as _PROJ_KEY
-    jql = (
+    jql_short = (
         f'project="{_PROJ_KEY}" AND labels="{short_tag}" '
         f'AND labels="{repo}" '
         f'AND status NOT IN ("Closed","Excepted","Rejected")'
     )
     try:
-        res = jira._get("/search", params={"jql": jql, "maxResults": 1, "fields": "key"})
+        res = jira._get("/search", params={"jql": jql_short, "maxResults": 1, "fields": "key"})
         issues = res.get("issues", [])
         if issues:
+            log.info("Dedup: found existing issue %s via short rem- label", issues[0]["key"])
             return issues[0]["key"]
     except Exception as exc:
-        log.warning("Remediation-id search failed, falling back to vuln-id search: %s", exc)
+        log.warning("Dedup: short rem- label search failed (%s), trying full remediation-id label", exc)
 
-    # Fallback: check against the first vuln ID (handles re-scans)
-    all_ids = _all_vuln_ids(norm)
-    if all_ids:
-        return jira.find_open_issue(all_ids[0], repo)
+    # ── Search 2: full remediation-id label (set just after creation) ──────────
+    full_tag = f"remediation-id-{rem_id}"
+    jql_full = (
+        f'project="{_PROJ_KEY}" AND labels="{full_tag}" '
+        f'AND status NOT IN ("Closed","Excepted","Rejected")'
+    )
+    try:
+        res = jira._get("/search", params={"jql": jql_full, "maxResults": 1, "fields": "key"})
+        issues = res.get("issues", [])
+        if issues:
+            log.info("Dedup: found existing issue %s via full remediation-id label", issues[0]["key"])
+            return issues[0]["key"]
+    except Exception as exc:
+        log.warning("Dedup: full remediation-id label search also failed (%s) — will create new issue", exc)
 
     return None
 

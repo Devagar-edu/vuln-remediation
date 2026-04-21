@@ -49,13 +49,24 @@ class JiraClient:
         return self._get(f"/issue/{key}")
 
     def find_open_issue(self, snyk_id: str, repo: str) -> Optional[str]:
-        """Return the key of an existing open issue for this vuln+repo, or None."""
+        """Return the key of an existing open issue for this vuln+repo, or None.
+
+        Uses summary~ text search.  Some Jira configurations reject JQL with
+        special characters (colons, hyphens) in the search term and return 4xx.
+        Any HTTP or parse error is caught and logged — the caller receives None
+        so the pipeline can continue rather than abort.
+        """
         jql = (f'project="{JIRA_PROJECT_KEY}" AND summary~"{snyk_id}" '
                f'AND labels="{repo}" '
                f'AND status NOT IN ("Closed","Excepted","Rejected")')
-        res = self._get("/search", params={"jql": jql, "maxResults": 1, "fields": "key"})
-        issues = res.get("issues", [])
-        return issues[0]["key"] if issues else None
+        try:
+            res = self._get("/search", params={"jql": jql, "maxResults": 1, "fields": "key"})
+            issues = res.get("issues", [])
+            return issues[0]["key"] if issues else None
+        except Exception as exc:
+            log.warning("find_open_issue JQL search failed for '%s' in %s: %s",
+                        snyk_id, repo, exc)
+            return None
 
     def create_issue(self, summary: str, description: dict,
                      labels: list[str], priority: str) -> str:
