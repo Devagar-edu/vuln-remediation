@@ -164,13 +164,17 @@ def run(jira_id: str, remediation_id: str) -> None:
     pom       = _get_pom(repo, branch)
     snippets  = _get_snippets(repo, branch, norm)
 
-    # 3. Load memory
+    # 3. Load memory — gather history for ALL vulnerabilities in this single issue
     history = []
     for pkg in norm.get("dependency_vulnerabilities", []):
         for v in pkg.get("vulnerabilities", []):
             h = memory.get_history(repo, v["id"])
             if h:
                 history.append(h)
+    for v in norm.get("code_vulnerabilities", []):
+        h = memory.get_history(repo, v["id"])
+        if h:
+            history.append(h)
     known_fixes = memory.all_known_fixes()
 
     # 4. Determine plan version

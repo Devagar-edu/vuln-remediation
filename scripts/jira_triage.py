@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-jira_triage.py — Create or update Jira issues from a normalised vulnerability JSON.
+jira_triage.py — Create or update a single Jira issue per execution from a
+                  normalised vulnerability JSON.
 
-One Jira issue is created per unique dependency package group and per unique
-code-vulnerability rule.  Existing open issues are detected and only commented
-on (not duplicated).
+One Jira issue is created per scan execution, combining ALL dependency and
+code vulnerabilities into a single ticket.  If an open issue already exists
+for this remediation_id (e.g. a re-scan), it is commented on rather than
+duplicated.
 
 Usage:
     python scripts/jira_triage.py normalised.json \
@@ -18,16 +20,8 @@ import logging
 import sys
 from pathlib import Path
 
-# Ensure the vuln-remediation root is on sys.path regardless of invocation
-# location. GitHub Actions calls this as:
-#   python vuln-remediation/scripts/jira_triage.py  (from the app repo root)
-# which puts vuln-remediation/scripts/ on sys.path, not vuln-remediation/.
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
 from scripts.utils import memory
-from scripts.utils.config import JiraStatus, SEVERITY_ORDER
+from scripts.utils.config import JiraStatus, SEVERITY_ORDER, JIRA_PROJECT_KEY
 from scripts.utils.jira_client import JiraClient
 
 log = logging.getLogger(__name__)
@@ -36,12 +30,32 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _top_severity(vuln_list: list) -> str:
+def _top_severity(norm: dict) -> str:
+    """Return the highest severity across ALL vulnerabilities in the scan."""
+    all_severities: list[str] = []
+
+    for pkg in norm.get("dependency_vulnerabilities", []):
+        for v in pkg.get("vulnerabilities", []):
+            all_severities.append(v.get("severity", "low").lower())
+
+    for v in norm.get("code_vulnerabilities", []):
+        all_severities.append(v.get("severity", "low").lower())
+
     for sev in SEVERITY_ORDER:
-        for v in vuln_list:
-            if v.get("severity", "").lower() == sev:
-                return sev
+        if sev in all_severities:
+            return sev
     return "low"
+
+
+def _all_vuln_ids(norm: dict) -> list[str]:
+    """Return every vulnerability ID present in the normalised scan."""
+    ids: list[str] = []
+    for pkg in norm.get("dependency_vulnerabilities", []):
+        for v in pkg.get("vulnerabilities", []):
+            ids.append(v["id"])
+    for v in norm.get("code_vulnerabilities", []):
+        ids.append(v["id"])
+    return ids
 
 
 def _description_text(norm: dict) -> str:
@@ -55,19 +69,29 @@ def _description_text(norm: dict) -> str:
         "",
         "═══ DEPENDENCY VULNERABILITIES ═══",
     ]
-    for pkg in norm.get("dependency_vulnerabilities", []):
-        lines.append(f"\n▸ {pkg['package']}  "
-                     f"{pkg['current_version']} → {pkg['recommended_fix_version']}")
-        for v in pkg.get("vulnerabilities", []):
-            cves = ", ".join(v.get("cve", [])) or "no CVE"
-            lines.append(f"  {v['id']}  [{v['severity'].upper()}]  "
-                         f"CVSS:{v.get('cvss', 0)}  {cves}")
+    dep_vulns = norm.get("dependency_vulnerabilities", [])
+    if dep_vulns:
+        for pkg in dep_vulns:
+            lines.append(f"\n▸ {pkg['package']}  "
+                         f"{pkg['current_version']} → {pkg['recommended_fix_version']}")
+            for v in pkg.get("vulnerabilities", []):
+                cves = ", ".join(v.get("cve", [])) or "no CVE"
+                lines.append(f"  {v['id']}  [{v['severity'].upper()}]  "
+                             f"CVSS:{v.get('cvss', 0)}  {cves}")
+    else:
+        lines.append("  (none)")
+
     lines += ["", "═══ CODE VULNERABILITIES ═══"]
-    for v in norm.get("code_vulnerabilities", []):
-        files = ", ".join(o["file"] for o in v.get("occurrences", []))
-        lines.append(f"\n▸ {v['rule_name']}  [{v['severity'].upper()}]")
-        lines.append(f"  {v['description']}")
-        lines.append(f"  Files: {files}")
+    code_vulns = norm.get("code_vulnerabilities", [])
+    if code_vulns:
+        for v in code_vulns:
+            files = ", ".join(o["file"] for o in v.get("occurrences", []))
+            lines.append(f"\n▸ {v['rule_name']}  [{v['severity'].upper()}]")
+            lines.append(f"  {v['description']}")
+            lines.append(f"  Files: {files}")
+    else:
+        lines.append("  (none)")
+
     s = norm["summary"]
     lines += [
         "",
@@ -77,80 +101,139 @@ def _description_text(norm: dict) -> str:
     return "\n".join(lines)
 
 
-def _groups_from_norm(norm: dict) -> list[dict]:
+def _issue_summary(norm: dict, top_severity: str) -> str:
+    """Build the single Jira issue summary line."""
+    m = norm["scan_metadata"]
+    repo = m["repository"]
+    s = norm["summary"]
+    counts = []
+    if s.get("critical_count", 0):
+        counts.append(f"{s['critical_count']} critical")
+    if s.get("high_count", 0):
+        counts.append(f"{s['high_count']} high")
+    if s.get("medium_count", 0):
+        counts.append(f"{s['medium_count']} medium")
+    if s.get("low_count", 0):
+        counts.append(f"{s['low_count']} low")
+    count_str = ", ".join(counts) if counts else "no"
+    return f"[{repo}] Vulnerability scan: {count_str} vulnerabilities ({top_severity.upper()})"
+
+
+def _find_existing_issue(norm: dict, jira: JiraClient) -> str | None:
     """
-    Return a flat list of issue groups.  Each group becomes one Jira issue.
+    Look for an already-open Jira issue created for this remediation_id.
+    Falls back to searching by any of the individual vuln IDs.
     """
-    groups = []
-    repo = norm["scan_metadata"]["repository"]
+    m = norm["scan_metadata"]
+    repo = m["repository"]
+    rem_id = m["remediation_id"]
 
-    # One issue per vulnerable package (groups all CVEs on that package together)
-    for pkg in norm.get("dependency_vulnerabilities", []):
-        vulns = pkg.get("vulnerabilities", [])
-        top   = _top_severity(vulns)
-        groups.append({
-            "type":       "dependency",
-            "summary":    f"[{repo}] Dependency vulnerability: {pkg['package']} ({top.upper()})",
-            "severity":   top,
-            "primary_id": vulns[0]["id"] if vulns else pkg["id"],
-            "all_ids":    [v["id"] for v in vulns],
-        })
+    # Primary: search by the remediation-id label (exact match, fast)
+    short_tag = f"rem-{rem_id[:8]}"
+    from scripts.utils.config import JIRA_PROJECT_KEY as _PROJ_KEY
+    jql = (
+        f'project="{_PROJ_KEY}" AND labels="{short_tag}" '
+        f'AND labels="{repo}" '
+        f'AND status NOT IN ("Closed","Excepted","Rejected")'
+    )
+    try:
+        res = jira._get("/search", params={"jql": jql, "maxResults": 1, "fields": "key"})
+        issues = res.get("issues", [])
+        if issues:
+            return issues[0]["key"]
+    except Exception as exc:
+        log.warning("Remediation-id search failed, falling back to vuln-id search: %s", exc)
 
-    # One issue per code vulnerability rule
-    for v in norm.get("code_vulnerabilities", []):
-        groups.append({
-            "type":       "code",
-            "summary":    f"[{repo}] Code vulnerability: {v['rule_name']} ({v['severity'].upper()})",
-            "severity":   v.get("severity", "low"),
-            "primary_id": v["id"],
-            "all_ids":    [v["id"]],
-        })
+    # Fallback: check against the first vuln ID (handles re-scans)
+    all_ids = _all_vuln_ids(norm)
+    if all_ids:
+        return jira.find_open_issue(all_ids[0], repo)
 
-    return groups
+    return None
 
 
 # ── Main triage ───────────────────────────────────────────────────────────────
 
 def triage(norm: dict, jira: JiraClient) -> list[str]:
-    """Create/update a single Jira issue per execution. Returns the issue key."""
-    meta = norm["scan_metadata"]
-    repo = meta["repository"]
+    """
+    Create or update a SINGLE Jira issue for all vulnerabilities in this scan.
+    Returns a list containing the one issue key touched (or empty if all excepted).
+    """
+    meta   = norm["scan_metadata"]
+    repo   = meta["repository"]
     rem_id = meta["remediation_id"]
-    desc = _description_text(norm)
-    touched: list[str] = []
+    desc   = _description_text(norm)
 
-    # Aggregate all groups into a single description
-    aggregated_description = f"Repository: {repo}\nRemediation ID: {rem_id}\n\n"
-    for group in _groups_from_norm(norm):
-        primary = group["primary_id"]
+    all_ids = _all_vuln_ids(norm)
 
-        # 1. Exception check
-        exc, reason = memory.is_excepted(primary)
+    # ── Check if every vulnerability is excepted ───────────────────────────
+    non_excepted_ids: list[str] = []
+    for vid in all_ids:
+        exc, reason = memory.is_excepted(vid)
         if exc:
-            log.info("Skipping excepted vulnerability %s: %s", primary, reason)
-            continue
+            log.info("Vulnerability %s is excepted: %s", vid, reason)
+        else:
+            non_excepted_ids.append(vid)
 
-        # Add group details to the aggregated description
-        aggregated_description += f"- Vulnerability: {primary}\n"
+    if not non_excepted_ids:
+        log.info("All vulnerabilities in this scan are excepted — no Jira issue created.")
+        return []
 
-    # 2. Check for an existing Jira issue for this remediation ID
-    existing = jira.find_open_issue(rem_id, repo)
+    top_severity = _top_severity(norm)
+    summary      = _issue_summary(norm, top_severity)
+    priority     = JiraClient.severity_to_priority(top_severity)
+    labels       = [repo, "vulnerability-scan", top_severity, f"rem-{rem_id[:8]}"]
+
+    # ── De-duplicate against existing open issues ──────────────────────────
+    existing = _find_existing_issue(norm, jira)
     if existing:
-        log.info("Issue %s already open for remediation ID %s — updating description", existing, rem_id)
-        jira.update_issue(existing, aggregated_description)
-        touched.append(existing)
-    else:
-        # 3. Create a new Jira issue
-        new_issue = jira.create_issue(
-            summary=f"Remediation for {repo} - {rem_id}",
-            description=aggregated_description,
-            project=meta["jira_project"],
-            issue_type="Task"  # Adjust the issue type as needed
+        log.info("Open issue %s already exists for remediation %s — adding re-scan comment",
+                 existing, rem_id)
+        jira.add_comment(
+            existing,
+            f"Re-scan at {meta['scan_time']} still detects vulnerabilities.\n"
+            f"Commit: {meta['commit_id']}\n"
+            f"Outstanding IDs: {', '.join(non_excepted_ids)}",
         )
-        log.info("Created new Jira issue %s for remediation ID %s", new_issue, rem_id)
-        touched.append(new_issue)
+        # Refresh the attachment with the latest normalised JSON
+        jira.add_attachment(existing, "normalised-vulnerabilities.json",
+                            json.dumps(norm, indent=2).encode(), "application/json")
+        return [existing]
 
-    return touched
+    # ── Create a single new issue covering all vulnerabilities ─────────────
+    key = jira.create_issue(
+        summary     = summary,
+        description = JiraClient.to_adf(desc),
+        labels      = labels,
+        priority    = priority,
+    )
+
+    # Store full remediation-id as a label for webhook lookups
+    jira.add_label(key, f"remediation-id-{rem_id}")
+
+    # Attach the full normalised JSON (consumed by plan + fix agents)
+    jira.add_attachment(key, "normalised-vulnerabilities.json",
+                        json.dumps(norm, indent=2).encode(), "application/json")
+
+    # Transition to Open
+    jira.transition(key, JiraStatus.OPEN)
+
+    # Audit — record all vuln IDs against the single issue
+    memory.audit(
+        event          = "jira_issue_created",
+        jira_id        = key,
+        repo           = repo,
+        remediation_id = rem_id,
+        actor          = "jira-triage",
+        details        = {"vuln_ids": non_excepted_ids, "severity": top_severity,
+                          "total_vulns": len(all_ids),
+                          "excepted_count": len(all_ids) - len(non_excepted_ids)},
+    )
+
+    log.info("Created single issue %s covering %d vulnerability/ies (remediation %s)",
+             key, len(non_excepted_ids), rem_id)
+    return [key]
+
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
