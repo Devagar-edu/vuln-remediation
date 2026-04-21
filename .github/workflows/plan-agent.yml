@@ -43,7 +43,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install --upgrade -r requirements.txt
 
       # Scripts are called as "python scripts/agents/foo.py" from the
       # vuln-remediation checkout root, so PYTHONPATH must point there.
