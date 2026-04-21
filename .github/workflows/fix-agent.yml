@@ -74,9 +74,9 @@ jobs:
 
       - name: Run Fix Agent
         env:
-          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN }}
-          GITHUB_ORG:          ${{ secrets.GITHUB_ORG }}
+          GITHUB_TOKEN:        ${{ secrets.ORG_GITHUB_TOKEN }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ORG:          ${{ secrets.ORG_NAME }}
           GOVERNANCE_REPO:     ${{ secrets.GOVERNANCE_REPO }}
           JIRA_URL:            ${{ secrets.JIRA_URL }}
           JIRA_USER:           ${{ secrets.JIRA_USER }}
