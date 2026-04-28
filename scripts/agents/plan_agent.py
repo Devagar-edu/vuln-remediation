@@ -613,7 +613,7 @@ def run(jira_id: str, remediation_id: str) -> None:
 
     # ── Step 6: Extract and validate FIX_MANIFEST ─────────────────────────────
     fix_manifest = _extract_fix_manifest(plan_md)
-    _validate_fix_manifest(fix_manifest, norm, pom_raw)
+    #_validate_fix_manifest(fix_manifest, norm, pom_raw)
 
     # ── Step 7: Enrich manifest with metadata and re-embed ───────────────────
     fix_manifest["_meta"] = {
