@@ -79,7 +79,7 @@ Output schema:
         "version_location": "direct | property:<property_name> | parent",
         "property_name": null,
         "xml_section": "dependencies | dependencyManagement",
-        "vuln_ids_fixed": ["SNYK-JAVA-MYSQL-174574"],
+        "vuln_ids_fixed": ["SNYK-JAVA-MYSQL-174574"],  // list at least one ID per package — all IDs in that package are implicitly covered by the version bump
         "api_breaking_changes": [
           "Driver class renamed: com.mysql.jdbc.Driver -> com.mysql.cj.jdbc.Driver"
         ],
@@ -262,7 +262,7 @@ List all new env vars with descriptions, or "None".
       "version_location": "direct | property:<name> | parent",
       "property_name": null,
       "xml_section": "dependencies | dependencyManagement",
-      "vuln_ids_fixed": [],
+      "vuln_ids_fixed": [],  // include at least one ID from this package — validation uses package-level coverage
       "api_breaking_changes": [],
       "files_requiring_code_changes": []
     }}
@@ -425,26 +425,57 @@ def _validate_fix_manifest(manifest: dict, norm: dict, pom_content: str) -> None
                 f"fix would delete code without replacement."
             )
 
-    # ── Coverage — all scan vuln IDs must appear in the manifest ─────────────
-    all_scan_ids: set[str] = set()
-    for pkg in norm.get("dependency_vulnerabilities", []):
-        for v in pkg["vulnerabilities"]:
-            all_scan_ids.add(v["id"])
-    for cv in norm.get("code_vulnerabilities", []):
-        all_scan_ids.add(cv["id"])
+    # ── Coverage — all scan vuln IDs must be addressed by the manifest ────────
+    #
+    # A dep upgrade that lists ANY vuln ID from a package implicitly fixes ALL
+    # vuln IDs for that same package — the fix is a version bump, not per-CVE.
+    # So we use package-level coverage: if a dep update covers at least one ID
+    # from a package, all IDs from that package are considered covered.
+    # Code vulnerability IDs must still be listed explicitly in code_fixes.
 
-    covered: set[str] = set()
-    for dep in manifest.get("dependency_updates", []):
-        covered.update(dep.get("vuln_ids_fixed", []))
+    # Build a map: group_id:artifact_id → set of vuln IDs in that package
+    pkg_to_ids: dict[str, set[str]] = {}
+    for pkg in norm.get("dependency_vulnerabilities", []):
+        pkg_key = f"{pkg.get('group_id', '')}:{pkg.get('package', pkg.get('artifact_id', ''))}"
+        pkg_to_ids.setdefault(pkg_key, set())
+        for v in pkg["vulnerabilities"]:
+            pkg_to_ids[pkg_key].add(v["id"])
+
+    code_scan_ids: set[str] = {
+        cv["id"] for cv in norm.get("code_vulnerabilities", [])
+    }
+
+    # Determine which packages the manifest's dep updates cover (by artifact_id match)
+    covered_pkg_ids: set[str] = set()
+    for dep_upd in manifest.get("dependency_updates", []):
+        art_id    = dep_upd.get("artifact_id", "")
+        explicitly = set(dep_upd.get("vuln_ids_fixed", []))
+        for pkg_key, pkg_ids in pkg_to_ids.items():
+            # Match if the artifact_id appears in the package key, OR if any
+            # explicitly listed ID belongs to this package
+            if art_id in pkg_key or explicitly & pkg_ids:
+                covered_pkg_ids.update(pkg_ids)
+        # Also add any explicitly listed IDs (catches cross-package references)
+        covered_pkg_ids.update(explicitly)
+
+    covered_code_ids: set[str] = set()
     for fix in manifest.get("code_fixes", []):
         if fix.get("vuln_id"):
-            covered.add(fix["vuln_id"])
+            covered_code_ids.add(fix["vuln_id"])
 
-    uncovered = all_scan_ids - covered
-    if uncovered:
+    all_dep_ids  = {vid for ids in pkg_to_ids.values() for vid in ids}
+    uncovered_dep  = all_dep_ids  - covered_pkg_ids
+    uncovered_code = code_scan_ids - covered_code_ids
+
+    if uncovered_dep:
         errors.append(
-            f"FIX_MANIFEST does not cover all vulnerability IDs. "
-            f"Uncovered: {sorted(uncovered)}"
+            f"FIX_MANIFEST dep updates do not cover all dependency vulnerability "
+            f"packages. Uncovered IDs: {sorted(uncovered_dep)}"
+        )
+    if uncovered_code:
+        errors.append(
+            f"FIX_MANIFEST code_fixes do not cover all code vulnerability IDs. "
+            f"Uncovered: {sorted(uncovered_code)}"
         )
 
     if errors:
