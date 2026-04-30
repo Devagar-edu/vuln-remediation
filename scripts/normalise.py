@@ -20,6 +20,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+import re
 
 # Ensure the vuln-remediation root is on sys.path so this script can be called
 # as "python vuln-remediation/scripts/normalise.py" from any working directory.
@@ -60,6 +61,21 @@ def _build_meta(raw: dict, repo: str, branch: str,
     }
 
 
+def extract_version(dep_string):
+						   
+									   
+    if "@" in dep_string:
+        dep_string = dep_string.split("@")[-1]
+
+								  
+    dep_string = re.sub(r'(\.RELEASE|\.FINAL|\.GA|\.SP\d+)$', '', dep_string, flags=re.IGNORECASE)
+    dep_string = re.sub(r'[^0-9\.].*$', '', dep_string)
+
+																
+													   
+
+    return dep_string.strip() if dep_string else "0"
+
 # ── Snyk native (snyk test --json) ────────────────────────────────────────────
 
 def _parse_native_sca(raw: dict) -> list:
@@ -71,13 +87,28 @@ def _parse_native_sca(raw: dict) -> list:
         version  = v.get("version", "unknown")
         key = f"{pkg_name}@{version}"
 
+        fix_version = "unknown"
+        if v.get("upgradePath"):
+            fix_version = v["upgradePath"][-1]
+
+        elif v.get("nearestFixedInVersion"):
+            fix_version = v["nearestFixedInVersion"]
+
+        elif v.get("patched_versions"):
+            fix_version = v["patched_versions"]
+
+        elif v.get("fixedIn"):
+            fix_version = v["fixedIn"][0]
+
+        fix_ver = extract_version(fix_version)
+
         if key not in packages:
             fixed_in = v.get("fixedIn", [])
             packages[key] = {
                 "id":                    str(uuid.uuid4()),
                 "package":               pkg_name,
                 "current_version":       version,
-                "recommended_fix_version": fixed_in[0] if fixed_in else "",
+                "recommended_fix_version": fix_ver,
                 "vulnerabilities":       [],
                 "_meta": {
                     "excepted":         False,
