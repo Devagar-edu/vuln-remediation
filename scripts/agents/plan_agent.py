@@ -578,11 +578,13 @@ def run(jira_id: str, remediation_id: str) -> None:
     )
     analysis_raw  = chat(ANALYSIS_SYSTEM_PROMPT, analysis_prompt,
                          max_tokens=4096, temperature=0.05, json_mode=True)
+    log.info("testing:" + analysis_raw)
     analysis_json = parse_json_response(analysis_raw)
 
     log.info("Stage 1 complete: %d dep updates, %d code fixes",
              len(analysis_json.get("pom_analysis", {}).get("dependency_updates", [])),
              len(analysis_json.get("code_fixes", [])))
+    log.info("Plan testing:" + analysis_json)
 
     # Guardrail: no Java version changes in the analysis
     if any(tag in json.dumps(analysis_json)
