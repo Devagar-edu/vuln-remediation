@@ -58,6 +58,7 @@ EVERYTHING the automated fix tool needs to apply fixes correctly.
 
 ABSOLUTE RULES:
 - NEVER suggest changing the Java version (maven.compiler.source/target/release).
+- ONLY suggest versions that exist in Maven Central
 - Examine the actual pom.xml carefully:
     * Is the dependency version a literal value or a property reference (${...})?
     * Is it in <dependencies> or <dependencyManagement>?
