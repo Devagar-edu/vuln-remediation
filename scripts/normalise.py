@@ -100,7 +100,7 @@ def _parse_native_sca(raw: dict) -> list:
         elif v.get("fixedIn"):
             fix_version = v["fixedIn"][0]
 
-        fix_ver = extract_version(fix_version)
+        #fix_ver = extract_version(fix_version)
 
         if key not in packages:
             fixed_in = v.get("fixedIn", [])
@@ -108,7 +108,7 @@ def _parse_native_sca(raw: dict) -> list:
                 "id":                    str(uuid.uuid4()),
                 "package":               pkg_name,
                 "current_version":       version,
-                "recommended_fix_version": fix_ver,
+                "recommended_fix_version": fix_version,
                 "vulnerabilities":       [],
                 "_meta": {
                     "excepted":         False,
