@@ -122,9 +122,10 @@ ANALYSIS_USER_TEMPLATE = """\
 Analyse this vulnerability scan and the actual source files.
 
 ## Vulnerability Scan Data
-```json
+(compact table — ALL packages listed; every row must have a dependency_update in your output)
+
 {vuln_json}
-```
+   
 
 ## pom.xml (actual content from repository, line-numbered)
 ```xml
@@ -338,6 +339,76 @@ def _get_source_files_numbered(repo: str, branch: str, norm: dict) -> str:
     return "\n\n".join(sections) if sections else "_No code vulnerabilities._"
 
 
+def _build_dep_summary(norm: dict) -> str:
+    """
+    Build a compact, token-efficient summary of ALL dependency vulnerabilities.
+
+    Full Snyk JSON with long CVE descriptions easily exceeds context limits when
+    there are many packages.  This function produces a concise table that fits
+    all packages while preserving everything the LLM needs to build the manifest:
+    package name, current version, fix version, severity, and ALL vuln IDs.
+    """
+    lines = [
+        "## Dependency Vulnerabilities",
+        f"Total packages affected: {len(norm.get('dependency_vulnerabilities', []))}",
+        "",
+        "| Package | Current | Fix Version | Severities | Vuln IDs |",
+        "|---------|---------|-------------|------------|----------|",
+    ]
+
+    for pkg in norm.get("dependency_vulnerabilities", []):
+        pkg_name = pkg.get("package", "unknown")
+        cur_ver  = pkg.get("current_version", "?")
+        fix_ver  = pkg.get("recommended_fix_version", "?")
+        vulns    = pkg.get("vulnerabilities", [])
+
+        # Compact severity summary: e.g. "2C 3H 1M"
+        sev_counts: dict[str, int] = {}
+        for v in vulns:
+            s = v.get("severity", "low")[0].upper()
+            sev_counts[s] = sev_counts.get(s, 0) + 1
+        sev_str = " ".join(
+            f"{n}{s}" for s, n in sorted(
+                sev_counts.items(),
+                key=lambda x: "CHML".index(x[0]) if x[0] in "CHML" else 9,
+            )
+        )
+
+        # ALL vuln IDs — critical so coverage validation can match them
+        ids = [v.get("id", "") for v in vulns if v.get("id")]
+        ids_str = ", ".join(ids)
+        lines.append(f"| {pkg_name} | {cur_ver} | {fix_ver} | {sev_str} | {ids_str} |")
+
+    # Code vulnerabilities
+    code_vulns = norm.get("code_vulnerabilities", [])
+    if code_vulns:
+        lines += [
+            "",
+            "## Code Vulnerabilities",
+            f"Total code issues: {len(code_vulns)}",
+            "",
+            "| ID | Rule | Severity | Files |",
+            "|----|------|----------|-------|",
+        ]
+        for cv in code_vulns:
+            files = ", ".join(o.get("file", "") for o in cv.get("occurrences", []))
+            lines.append(
+                f"| {cv.get('id','')} "
+                f"| {cv.get('rule_name', cv.get('rule_id',''))} "
+                f"| {cv.get('severity','')} "
+                f"| {files} |"
+            )
+
+    meta = norm.get("scan_metadata", {})
+    lines += [
+        "",
+        f"Repository: {meta.get('repository','')} | "
+        f"Branch: {meta.get('branch','')} | "
+        f"Commit: {meta.get('commit_id','')[:12]}",
+    ]
+    return "\n".join(lines)
+
+
 class PlanValidationError(Exception):
     """Raised when the generated plan/manifest fails validation."""
 
@@ -427,50 +498,88 @@ def _validate_fix_manifest(manifest: dict, norm: dict, pom_content: str) -> None
 
     # ── Coverage — all scan vuln IDs must be addressed by the manifest ────────
     #
-    # A dep upgrade that lists ANY vuln ID from a package implicitly fixes ALL
-    # vuln IDs for that same package — the fix is a version bump, not per-CVE.
-    # So we use package-level coverage: if a dep update covers at least one ID
-    # from a package, all IDs from that package are considered covered.
-    # Code vulnerability IDs must still be listed explicitly in code_fixes.
+    # DEP COVERAGE — package-level, not ID-level:
+    #   A single dep version bump fixes every CVE in that package at once.
+    #   We consider a package covered if ANY of the following match:
+    #     a) The manifest dep's artifact_id is a substring of the scan package name
+    #        (e.g. "xstream" in "com.thoughtworks.xstream")
+    #     b) The manifest dep's group_id is a substring of the scan package name
+    #        (e.g. "thoughtworks" in "com.thoughtworks.xstream")
+    #     c) Any explicitly listed vuln_ids_fixed ID belongs to this package
+    #     d) The scan package name is a substring of the manifest artifact_id
+    #        (handles reversed naming conventions)
+    #
+    # CODE COVERAGE — ID-level:
+    #   Each code vulnerability must have an explicit code_fix entry.
 
-    # Build a map: group_id:artifact_id → set of vuln IDs in that package
+    # Build a map: normalised package name → set of vuln IDs
     pkg_to_ids: dict[str, set[str]] = {}
     for pkg in norm.get("dependency_vulnerabilities", []):
-        pkg_key = f"{pkg.get('group_id', '')}:{pkg.get('package', pkg.get('artifact_id', ''))}"
-        pkg_to_ids.setdefault(pkg_key, set())
+        # Use the full package name as key — e.g. "com.thoughtworks.xstream"
+        pkg_name = pkg.get("package", pkg.get("artifact_id", "unknown")).lower()
+        pkg_to_ids.setdefault(pkg_name, set())
         for v in pkg["vulnerabilities"]:
-            pkg_to_ids[pkg_key].add(v["id"])
+            if v.get("id"):
+                pkg_to_ids[pkg_name].add(v["id"])
+
+    # Build a reverse map: vuln_id → package name (for explicit ID matching)
+    id_to_pkg: dict[str, str] = {}
+    for pkg_name, ids in pkg_to_ids.items():
+        for vid in ids:
+            id_to_pkg[vid] = pkg_name
 
     code_scan_ids: set[str] = {
         cv["id"] for cv in norm.get("code_vulnerabilities", [])
     }
 
-    # Determine which packages the manifest's dep updates cover (by artifact_id match)
+    # Mark packages as covered by each manifest dep update
     covered_pkg_ids: set[str] = set()
+
     for dep_upd in manifest.get("dependency_updates", []):
-        art_id    = dep_upd.get("artifact_id", "")
-        explicitly = set(dep_upd.get("vuln_ids_fixed", []))
-        for pkg_key, pkg_ids in pkg_to_ids.items():
-            # Match if the artifact_id appears in the package key, OR if any
-            # explicitly listed ID belongs to this package
-            if art_id in pkg_key or explicitly & pkg_ids:
+        art_id   = (dep_upd.get("artifact_id") or "").lower().strip()
+        grp_id   = (dep_upd.get("group_id")    or "").lower().strip()
+        explicit = set(dep_upd.get("vuln_ids_fixed", []))
+
+        for pkg_name, pkg_ids in pkg_to_ids.items():
+            matched = (
+                # a) artifact substring match
+                (art_id and art_id in pkg_name) or
+                # b) group substring match (last segment, e.g. "thoughtworks")
+                (grp_id and grp_id.split(".")[-1] in pkg_name) or
+                # c) explicit ID overlap
+                bool(explicit & pkg_ids) or
+                # d) reversed: package name appears in the artifact_id
+                (art_id and pkg_name.split(".")[-1] in art_id)
+            )
+            if matched:
                 covered_pkg_ids.update(pkg_ids)
-        # Also add any explicitly listed IDs (catches cross-package references)
-        covered_pkg_ids.update(explicitly)
+                log.debug("Coverage: manifest dep '%s:%s' covers package '%s' (%d IDs)",
+                          grp_id, art_id, pkg_name, len(pkg_ids))
 
-    covered_code_ids: set[str] = set()
-    for fix in manifest.get("code_fixes", []):
-        if fix.get("vuln_id"):
-            covered_code_ids.add(fix["vuln_id"])
+        # Also directly credit explicit IDs regardless of package match
+                                              
+                              
+        covered_pkg_ids.update(explicit)
 
-    all_dep_ids  = {vid for ids in pkg_to_ids.values() for vid in ids}
+    covered_code_ids: set[str] = {
+        fix["vuln_id"]
+        for fix in manifest.get("code_fixes", [])
+        if fix.get("vuln_id")
+    }
+
+    all_dep_ids    = {vid for ids in pkg_to_ids.values() for vid in ids}
     uncovered_dep  = all_dep_ids  - covered_pkg_ids
     uncovered_code = code_scan_ids - covered_code_ids
 
+    # Report uncovered as package names (more actionable than raw ID lists)
     if uncovered_dep:
+        uncovered_pkgs = sorted({
+            id_to_pkg.get(vid, vid) for vid in uncovered_dep
+        })
         errors.append(
-            f"FIX_MANIFEST dep updates do not cover all dependency vulnerability "
-            f"packages. Uncovered IDs: {sorted(uncovered_dep)}"
+            f"FIX_MANIFEST dep updates do not cover these vulnerable packages: "
+            f"{uncovered_pkgs}. "
+            f"Each package needs a dependency_update entry in the FIX_MANIFEST."
         )
     if uncovered_code:
         errors.append(
@@ -568,9 +677,18 @@ def run(jira_id: str, remediation_id: str) -> None:
     now                = datetime.now(timezone.utc).isoformat()
 
     # ── Step 4: Stage 1 — Analysis LLM call ──────────────────────────────────
+    # Build a compact dep summary so ALL packages fit within the context window.
+    # Full verbose JSON (with long CVE descriptions) easily exceeds 12k chars
+    # when there are many packages — truncating it causes the LLM to miss packages.
+    dep_summary = _build_dep_summary(norm)
+
     log.info("Stage 1: analysing actual source files (json_mode)…")
+    log.info("Dep summary: %d packages, %d chars (full JSON was %d chars)",
+             len(norm.get("dependency_vulnerabilities", [])),
+             len(dep_summary),
+             len(json.dumps(norm)))
     analysis_prompt = ANALYSIS_USER_TEMPLATE.format(
-        vuln_json            = json.dumps(norm, indent=2)[:12_000],
+        vuln_json            = dep_summary,
         pom_content          = pom_numbered[:6_000],
         source_files_section = source_section,
         history              = json.dumps(history, indent=2) if history else "[]",
@@ -578,13 +696,15 @@ def run(jira_id: str, remediation_id: str) -> None:
     )
     analysis_raw  = chat(ANALYSIS_SYSTEM_PROMPT, analysis_prompt,
                          max_tokens=4096, temperature=0.05, json_mode=True)
+    
     log.info("testing:" + analysis_raw)
+                                       
     analysis_json = parse_json_response(analysis_raw)
 
     log.info("Stage 1 complete: %d dep updates, %d code fixes",
              len(analysis_json.get("pom_analysis", {}).get("dependency_updates", [])),
              len(analysis_json.get("code_fixes", [])))
-    log.info("Plan testing:" + analysis_json)
+                                             
 
     # Guardrail: no Java version changes in the analysis
     if any(tag in json.dumps(analysis_json)
